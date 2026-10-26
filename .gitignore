@@ -9,3 +9,5 @@ checkpoints/
 .tmp/
 *.onnx
 *.TXT
+# sisya: local training outputs and viewer logs
+runs/

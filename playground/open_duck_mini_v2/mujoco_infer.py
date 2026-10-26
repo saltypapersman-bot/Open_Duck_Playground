@@ -110,17 +110,17 @@ class MjInfer(MJInferBase):
         lin_vel_y = 0
         ang_vel = 0
         if not self.head_control_mode:
-            if keycode == 265:  # arrow up
+            if keycode in (265, 328, 87):  # arrow up, keypad 8, W
                 lin_vel_x = self.COMMANDS_RANGE_X[1]
-            if keycode == 264:  # arrow down
+            if keycode in (264, 322, 83):  # arrow down, keypad 2, S
                 lin_vel_x = self.COMMANDS_RANGE_X[0]
-            if keycode == 263:  # arrow left
+            if keycode in (263, 324):  # arrow left, keypad 4
                 lin_vel_y = self.COMMANDS_RANGE_Y[1]
-            if keycode == 262:  # arrow right
+            if keycode in (262, 326):  # arrow right, keypad 6
                 lin_vel_y = self.COMMANDS_RANGE_Y[0]
-            if keycode == 81:  # a
+            if keycode in (81, 65):  # a (azerty q), A
                 ang_vel = self.COMMANDS_RANGE_THETA[1]
-            if keycode == 69:  # e
+            if keycode in (69, 68):  # e, D
                 ang_vel = self.COMMANDS_RANGE_THETA[0]
             if keycode == 80:  # p
                 self.phase_frequency_factor += 0.1
@@ -149,9 +149,15 @@ class MjInfer(MJInferBase):
             self.commands[5] = head_yaw
             self.commands[6] = head_roll
 
+        MAPPED = {265, 328, 87, 264, 322, 83, 263, 324, 262, 326, 81, 65, 69, 68}
+        if keycode == 32 or keycode == 88:  # space or X: stop
+            lin_vel_x = lin_vel_y = ang_vel = 0
+        elif keycode not in MAPPED or self.head_control_mode:
+            return  # ignore unmapped keys (focus changes, lock keys) instead of zeroing the command
         self.commands[0] = lin_vel_x
         self.commands[1] = lin_vel_y
         self.commands[2] = ang_vel
+        print(f"command: vx={lin_vel_x} vy={lin_vel_y} wz={ang_vel}")
 
     def run(self):
         try:
@@ -162,14 +168,43 @@ class MjInfer(MJInferBase):
                 show_right_ui=False,
                 key_callback=self.key_callback,
             ) as viewer:
+                # Camera follows the duck so it never walks out of frame.
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                viewer.cam.trackbodyid = mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_BODY, "trunk_assembly"
+                )
+                viewer.cam.distance = 1.0
+                viewer.cam.elevation = -20
+                viewer.cam.azimuth = 135
                 counter = 0
                 while True:
 
-                    step_start = time.time()
+                    step_start = time.perf_counter()
 
                     mujoco.mj_step(self.model, self.data)
 
                     counter += 1
+                    if counter == 1:
+                        wall0 = time.perf_counter()
+                    if counter % 1000 == 0 and getattr(self, "watch_dir", None):
+                        import glob, os
+                        files = sorted(glob.glob(os.path.join(self.watch_dir, "*.onnx")), key=os.path.getmtime)
+                        if files and files[-1] != getattr(self, "_loaded_onnx", None):
+                            newest = files[-1]
+                            try:
+                                self.policy = OnnxInfer(newest, awd=True)
+                            except TypeError:
+                                self.policy = OnnxInfer(newest)
+                            self._loaded_onnx = newest
+                            mujoco.mj_resetDataKeyframe(self.model, self.data, 0) if self.model.nkey else None
+                            self.data.qpos[:] = self.init_qpos if hasattr(self, "init_qpos") else self.data.qpos
+                            print(f"WATCH: loaded new checkpoint {os.path.basename(newest)}")
+                    if counter % 1000 == 0:
+                        print(
+                            f"diag: sim_t={self.data.time:.2f}s wall_t={time.perf_counter()-wall0:.2f}s "
+                            f"base_xy=({self.data.qpos[0]:.3f},{self.data.qpos[1]:.3f}) z={self.data.qpos[2]:.3f} "
+                            f"cmd={self.commands[:3]}"
+                        )
 
                     if counter % self.decimation == 0:
                         if not self.standing:
@@ -232,11 +267,11 @@ class MjInfer(MJInferBase):
 
                     viewer.sync()
 
-                    time_until_next_step = self.model.opt.timestep - (
-                        time.time() - step_start
-                    )
-                    if time_until_next_step > 0:
-                        time.sleep(time_until_next_step)
+                    # Windows time.sleep() granularity is ~15 ms, far coarser than the
+                    # 2 ms physics step, which made the sim run many times slower than
+                    # real time. Spin-wait for the remainder instead.
+                    while time.perf_counter() - step_start < self.model.opt.timestep:
+                        pass
         except KeyboardInterrupt:
             pickle.dump(self.saved_obs, open("mujoco_saved_obs.pkl", "wb"))
 
@@ -257,10 +292,13 @@ if __name__ == "__main__":
         default="playground/open_duck_mini_v2/xmls/scene_flat_terrain.xml",
     )
     parser.add_argument("--standing", action="store_true", default=False)
+    parser.add_argument("--watch_dir", type=str, default=None,
+        help="Folder of training checkpoints; reload the newest .onnx whenever one appears")
 
     args = parser.parse_args()
 
     mjinfer = MjInfer(
         args.model_path, args.reference_data, args.onnx_model_path, args.standing
     )
+    mjinfer.watch_dir = args.watch_dir
     mjinfer.run()
